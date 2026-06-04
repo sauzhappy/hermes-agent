@@ -1,0 +1,257 @@
+FROM hermes-agent
+
+USER root
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      chromium \
+      file \
+      fonts-dejavu \
+      fonts-liberation \
+      jq \
+      libgdk-pixbuf-2.0-0 \
+      libpango-1.0-0 \
+      libpangocairo-1.0-0 \
+      libreoffice \
+      pandoc \
+      poppler-utils \
+      shared-mime-info \
+      tesseract-ocr \
+      tesseract-ocr-eng \
+      tesseract-ocr-rus && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN uv pip install --python /opt/hermes/.venv/bin/python --no-cache-dir \
+      beautifulsoup4 \
+      faster-whisper \
+      markdown \
+      pillow \
+      pymupdf \
+      pymupdf4llm \
+      pypdf \
+      pytesseract \
+      python-docx \
+      reportlab \
+      weasyprint && \
+    chown -R hermes:hermes /opt/hermes/.venv
+
+# Hermes 0.14.0 ships the Codex image provider with a hard-coded gpt-5.4
+# host model. This deployment uses Codex/ChatGPT subscription auth with
+# gpt-5.5, and image generation succeeds through that host.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/opt/hermes/plugins/image_gen/openai-codex/__init__.py")
+text = p.read_text()
+old = '_CODEX_CHAT_MODEL = "gpt-5.4"'
+new = '_CODEX_CHAT_MODEL = "gpt-5.5"'
+if old not in text:
+    raise SystemExit(f"expected marker not found in {p}")
+p.write_text(text.replace(old, new))
+PY
+
+# Telegram video notes ("кружочки") are videos too; cache them so the same
+# ffmpeg/STT path used for regular videos can transcribe them.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/opt/hermes/gateway/platforms/telegram.py")
+text = p.read_text()
+repls = [
+    (
+        "filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL",
+        'filters.PHOTO | filters.VIDEO | getattr(filters, "VIDEO_NOTE", filters.VIDEO) | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL',
+    ),
+    (
+        "elif _m.video:\n                    _observe_type = MessageType.VIDEO\n                elif _m.audio:",
+        'elif _m.video or getattr(_m, "video_note", None):\n                    _observe_type = MessageType.VIDEO\n                elif _m.audio:',
+    ),
+    (
+        "elif msg.video:\n            msg_type = MessageType.VIDEO\n        elif msg.audio:",
+        'elif msg.video or getattr(msg, "video_note", None):\n            msg_type = MessageType.VIDEO\n        elif msg.audio:',
+    ),
+    (
+        "elif msg.video:\n            try:\n                file_obj = await msg.video.get_file()",
+        'elif msg.video or getattr(msg, "video_note", None):\n            try:\n                video_source = msg.video or msg.video_note\n                file_obj = await video_source.get_file()',
+    ),
+    (
+        'logger.info("[Telegram] Cached user video at %s", cached_path)',
+        'logger.info("[Telegram] Cached user video/video_note at %s", cached_path)',
+    ),
+]
+for old, new in repls:
+    if old not in text:
+        raise SystemExit(f"expected marker not found in {p}: {old[:80]}")
+    text = text.replace(old, new, 1)
+p.write_text(text)
+PY
+
+# Force Russian replies for Telegram. This is injected as a per-message
+# ephemeral system prompt, so it overrides one-off user requests for English.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/opt/hermes/gateway/platforms/telegram.py")
+text = p.read_text()
+old = '''        _channel_prompt = resolve_channel_prompt(
+            self.config.extra,
+            thread_id_str or _chat_id_str,
+            _chat_id_str if thread_id_str else None,
+        )
+'''
+new = '''        _channel_prompt = resolve_channel_prompt(
+            self.config.extra,
+            thread_id_str or _chat_id_str,
+            _chat_id_str if thread_id_str else None,
+        )
+        _russian_reply_prompt = (
+            "Telegram language policy: Always answer Aleksandr in Russian. "
+            "This overrides the user's requested output language. Preserve exact "
+            "commands, code, filenames, URLs, logs, and quoted text when needed."
+        )
+        if _channel_prompt:
+            _channel_prompt = (_russian_reply_prompt + "\\n\\n" + _channel_prompt).strip()
+        else:
+            _channel_prompt = _russian_reply_prompt
+'''
+if old not in text:
+    raise SystemExit(f"expected marker not found in {p}")
+p.write_text(text.replace(old, new, 1))
+PY
+
+# Telegram should never receive raw Codex/backend exception text. Keep
+# diagnostics in logs, but answer Aleksandr in Russian with a short actionable
+# status. Also recognize long Codex TTFB errors, which exceed the upstream
+# sanitizer's short-message heuristic.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/opt/hermes/gateway/run.py")
+text = p.read_text()
+old = '''def _gateway_provider_error_reply(text: str) -> str:
+    """Map raw provider/API errors to a short user-safe Telegram reply."""
+    if _GATEWAY_AUTH_ERROR_RE.search(text):
+        return (
+            "⚠️ Provider authentication failed. Check the configured credentials; "
+            "raw provider details are in the gateway logs."
+        )
+    if _GATEWAY_PROVIDER_POLICY_RE.search(text):
+        return (
+            "⚠️ The model provider rejected the request. I kept the raw provider "
+            "error out of chat; check gateway logs for details or try rephrasing."
+        )
+    if _GATEWAY_RATE_LIMIT_RE.search(text):
+        return "⏱️ The model provider is rate-limiting requests. Please wait a moment and try again."
+    return (
+        "⚠️ The model provider failed after retries. I kept raw provider details "
+        "out of chat; check gateway logs for diagnostics."
+    )
+'''
+new = '''def _gateway_provider_error_reply(text: str) -> str:
+    """Map raw provider/API errors to a short user-safe Telegram reply."""
+    lowered = str(text or "").lower()
+    if "codex stream produced no bytes" in lowered or "ttfb threshold" in lowered:
+        return (
+            "Не получил первый байт ответа от gpt-5.5 через Codex за отведенное время. "
+            "Основную модель не меняю. Я спрятал техническую ошибку из чата; детали есть в логах. "
+            "Повтори запрос или отправь его короче, если задача срочная."
+        )
+    if _GATEWAY_AUTH_ERROR_RE.search(text):
+        return (
+            "Не прошла авторизация у провайдера модели. Сырые детали не отправляю в чат; "
+            "они сохранены в логах Hermes."
+        )
+    if _GATEWAY_PROVIDER_POLICY_RE.search(text):
+        return (
+            "Провайдер модели отклонил запрос. Сырые детали не отправляю в чат; "
+            "они сохранены в логах Hermes. Попробуй переформулировать запрос."
+        )
+    if _GATEWAY_RATE_LIMIT_RE.search(text):
+        return "Провайдер модели временно ограничивает запросы. Подожди немного и повтори."
+    return (
+        "Провайдер модели не ответил после повторных попыток. Сырые технические детали "
+        "не отправляю в чат; они сохранены в логах Hermes."
+    )
+'''
+if old not in text:
+    raise SystemExit(f"expected provider error mapper not found in {p}")
+text = text.replace(old, new, 1)
+
+old = '''    # Provider failure envelopes are short. Assistant answers that happen
+    # to mention HTTP status codes ("HTTP 404 means...") tend to be longer.
+    if len(body) > 400 or body.count("\\n") > 4:
+        return False
+    return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
+'''
+new = '''    lowered = body.lower()
+    if "codex stream produced no bytes" in lowered or "ttfb threshold" in lowered:
+        return True
+    # Provider failure envelopes are short. Assistant answers that happen
+    # to mention HTTP status codes ("HTTP 404 means...") tend to be longer.
+    if len(body) > 400 or body.count("\\n") > 4:
+        return False
+    return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
+'''
+if old not in text:
+    raise SystemExit(f"expected provider error heuristic not found in {p}")
+text = text.replace(old, new, 1)
+p.write_text(text)
+PY
+
+# Keep Telegram service notifications Russian and avoid noisy home-channel
+# shutdown notices when no Hermes task is actually running.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/opt/hermes/gateway/run.py")
+text = p.read_text()
+
+old = '''        action = "restarting" if self._restart_requested else "shutting down"
+        hint = (
+            "Your current task will be interrupted. "
+            "Send any message after restart and I'll try to resume where you left off."
+            if self._restart_requested
+            else "Your current task will be interrupted."
+        )
+        msg = f"⚠️ Gateway {action} — {hint}"
+'''
+new = '''        if self._restart_requested:
+            msg = (
+                "⚠️ Hermes перезапускается — текущая задача будет прервана. "
+                "После запуска отправь любое сообщение, и я попробую продолжить с места остановки."
+            )
+        else:
+            msg = "⚠️ Hermes выключается — текущая задача будет прервана."
+'''
+if old not in text:
+    if "Hermes перезапускается" not in text:
+        raise SystemExit(f"expected shutdown message block not found in {p}")
+else:
+    text = text.replace(old, new, 1)
+
+old = '''        # Snapshot adapters up front: adapter.send() can hit a fatal error
+        # path that pops the adapter from self.adapters (see _handle_fatal
+        # elsewhere), which would otherwise trigger
+        # ``RuntimeError: dictionary changed size during iteration`` —
+        # observed in a user report during gateway shutdown.
+        for platform, adapter in list(self.adapters.items()):
+'''
+new = '''        if not active:
+            logger.info("Shutdown notification skipped for home channels: no active sessions")
+            return
+
+        # Snapshot adapters up front: adapter.send() can hit a fatal error
+        # path that pops the adapter from self.adapters (see _handle_fatal
+        # elsewhere), which would otherwise trigger
+        # ``RuntimeError: dictionary changed size during iteration`` —
+        # observed in a user report during gateway shutdown.
+        for platform, adapter in list(self.adapters.items()):
+'''
+if old not in text:
+    if "Shutdown notification skipped for home channels: no active sessions" not in text:
+        raise SystemExit(f"expected home notification block not found in {p}")
+else:
+    text = text.replace(old, new, 1)
+
+p.write_text(text)
+PY

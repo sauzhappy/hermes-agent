@@ -1,0 +1,34 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    image: hermes-agent-file-agent
+    env_file:
+      - .env
+    volumes:
+      - /srv/hermes/data:/opt/data
+      - /srv/hermes/media:/srv/hermes/media
+      - /srv/hermes/files:/srv/hermes/files
+      - /srv/hermes/documents:/srv/hermes/documents
+      - /srv/hermes/pdf:/srv/hermes/pdf
+      - /srv/hermes/transcripts:/srv/hermes/transcripts
+      - /srv/hermes/generated_images:/srv/hermes/generated_images
+      - /srv/hermes/obsidian:/srv/hermes/obsidian
+      - /srv/hermes/scripts:/srv/hermes/scripts
+      - /srv/hermes/logs:/srv/hermes/logs
+  dashboard:
+    image: hermes-agent-file-agent
+    env_file:
+      - .env
+    volumes:
+      - /srv/hermes/data:/opt/data
+      - /srv/hermes/media:/srv/hermes/media
+      - /srv/hermes/files:/srv/hermes/files
+      - /srv/hermes/documents:/srv/hermes/documents
+      - /srv/hermes/pdf:/srv/hermes/pdf
+      - /srv/hermes/transcripts:/srv/hermes/transcripts
+      - /srv/hermes/generated_images:/srv/hermes/generated_images
+      - /srv/hermes/obsidian:/srv/hermes/obsidian
+      - /srv/hermes/scripts:/srv/hermes/scripts
+      - /srv/hermes/logs:/srv/hermes/logs
